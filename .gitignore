@@ -1,0 +1,35 @@
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MLX
+*.safetensors
+*.gputrace/
+
+# Env
+.env
+.venv/
+
+# Ruff
+.ruff_cache/

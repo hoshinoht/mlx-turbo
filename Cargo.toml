@@ -1,0 +1,19 @@
+[package]
+name = "mlx-turbo-core"
+version = "0.1.0"
+edition = "2021"
+description = "TurboQuant KV cache compression — Rust core with Python bindings"
+license = "MIT"
+
+[lib]
+name = "mlx_turbo_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
