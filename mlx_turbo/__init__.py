@@ -11,5 +11,6 @@ Papers:
 """
 
 from mlx_turbo._core import TurboEngine, build_codebook, generate_sign_flips
+from mlx_turbo.patch import patch, load
 
 __version__ = "0.1.0"
