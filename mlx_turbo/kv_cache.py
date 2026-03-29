@@ -1,11 +1,9 @@
 """
-TurboQuant KV cache for mlx-lm — backed by Rust core.
+TurboQuant KV cache for mlx-lm.
 
-The compress/decompress hot path runs in native Rust (mlx_turbo._core).
-This wrapper handles:
-  - MLX array <-> numpy conversion at the boundary
-  - Pre-allocated decompressed buffer management (mlx-lm KVCache pattern)
-  - mlx-lm cache interface (update_and_fetch, state, make_mask, etc.)
+Uses Metal GPU kernels for compress/decompress — no CPU bridge crossing.
+Data stays as mx.array the entire time.
+Rust backend used only for one-time codebook precomputation at init.
 """
 
 from typing import Optional
@@ -13,15 +11,13 @@ from typing import Optional
 import numpy as np
 import mlx.core as mx
 
-from mlx_turbo._core import TurboEngine
+from mlx_turbo._core import TurboEngine, build_codebook, generate_sign_flips
+from mlx_turbo.metal_ops import metal_compress, metal_decompress
 
 
 class TurboQuantKVCache:
     """
-    Drop-in KVCache replacement using Rust-backed TurboQuant compression.
-
-    Compatible with mlx-lm's cache interface:
-      update_and_fetch, state, offset, size, empty, is_trimmable, trim, make_mask
+    Drop-in KVCache replacement with Metal-accelerated TurboQuant compression.
     """
 
     step: int = 256
@@ -34,41 +30,99 @@ class TurboQuantKVCache:
         seed: int = 42,
         val_seed: int = 73,
     ):
-        # DO NOT name this self.bits — mlx-lm routes to quantized SDPA if it exists
         self._tq_bits = bits
         self.head_dim = head_dim
         self.step = step
 
-        # Rust engines for keys and values
-        self._key_engine = TurboEngine(bits, head_dim, seed)
-        self._val_engine = TurboEngine(min(bits, 4), head_dim, val_seed)
+        # Precompute codebooks via Rust (once), store as persistent MLX arrays
+        k_c, k_b = build_codebook(bits, head_dim)
+        v_c, v_b = build_codebook(min(bits, 4), head_dim)
+        k_signs = np.array(generate_sign_flips(head_dim, seed))
+        v_signs = np.array(generate_sign_flips(head_dim, val_seed))
+
+        self._k_centroids = mx.array(k_c)
+        self._k_boundaries = mx.array(k_b)
+        self._k_signs = mx.array(k_signs)
+        self._v_centroids = mx.array(v_c)
+        self._v_boundaries = mx.array(v_b)
+        self._v_signs = mx.array(v_signs)
+        self._v_bits = min(bits, 4)
+
+        # For compressed byte tracking
+        k_vpw = 32 // bits
+        v_vpw = 32 // self._v_bits
+        self._k_bpv = ((head_dim + k_vpw - 1) // k_vpw) * 4 + 4
+        self._v_bpv = ((head_dim + v_vpw - 1) // v_vpw) * 4 + 4
 
         # State
         self.offset: int = 0
         self._input_dtype = mx.float16
 
-        # Pre-allocated decompressed buffers (mlx-lm KVCache pattern)
+        # Pre-allocated decompressed buffers
         self.keys: Optional[mx.array] = None
         self.values: Optional[mx.array] = None
 
-        # Compressed storage for memory accounting
         self._compressed_bytes: int = 0
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
     ) -> tuple[mx.array, mx.array]:
-        """Compress new K/V via Rust, write decompressed into pre-allocated buffers."""
+        """Compress/decompress via Metal kernels. No CPU bridge."""
         B, n_kv, num_new, hd = keys.shape
         prev = self.offset
         self._input_dtype = keys.dtype
 
-        # --- Compress + decompress via Rust (per KV-head, flattened) ---
-        new_keys = self._rust_roundtrip(self._key_engine, keys, B, n_kv, num_new, hd)
-        new_values = self._rust_roundtrip(
-            self._val_engine, values, B, n_kv, num_new, hd
+        # Flatten to (n_vecs * hd,) — stays as mx.array on GPU
+        n_vecs = B * n_kv * num_new
+        k_flat = keys.astype(mx.float32).reshape(-1)
+        v_flat = values.astype(mx.float32).reshape(-1)
+
+        # Metal compress + decompress (all GPU, no bridge)
+        k_packed, k_norms = metal_compress(
+            k_flat,
+            self._k_signs,
+            self._k_boundaries,
+            n_vecs,
+            hd,
+            self._tq_bits,
+        )
+        new_keys = (
+            metal_decompress(
+                k_packed,
+                k_norms,
+                self._k_centroids,
+                self._k_signs,
+                n_vecs,
+                hd,
+                self._tq_bits,
+            )
+            .reshape(B, n_kv, num_new, hd)
+            .astype(self._input_dtype)
         )
 
-        # --- Write into pre-allocated MLX buffers ---
+        v_packed, v_norms = metal_compress(
+            v_flat,
+            self._v_signs,
+            self._v_boundaries,
+            n_vecs,
+            hd,
+            self._v_bits,
+        )
+        new_values = (
+            metal_decompress(
+                v_packed,
+                v_norms,
+                self._v_centroids,
+                self._v_signs,
+                n_vecs,
+                hd,
+                self._v_bits,
+            )
+            .reshape(B, n_kv, num_new, hd)
+            .astype(self._input_dtype)
+        )
+
+        # Write into pre-allocated MLX buffers
         if self.keys is None or (prev + num_new) > self.keys.shape[2]:
             n_steps = (self.step + num_new - 1) // self.step
             new_cap = n_steps * self.step
@@ -86,34 +140,9 @@ class TurboQuantKVCache:
         self.keys[..., prev : prev + num_new, :] = new_keys
         self.values[..., prev : prev + num_new, :] = new_values
 
-        # Track compressed size
-        kbpv = self._key_engine.bytes_per_vector()
-        vbpv = self._val_engine.bytes_per_vector()
-        self._compressed_bytes += num_new * n_kv * (kbpv + vbpv)
-
+        self._compressed_bytes += num_new * n_kv * (self._k_bpv + self._v_bpv)
         self.offset += num_new
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
-
-    def _rust_roundtrip(
-        self, engine: TurboEngine, data: mx.array, B: int, n_kv: int, seq: int, hd: int
-    ) -> mx.array:
-        """
-        MLX array -> numpy -> Rust compress+decompress -> numpy -> MLX array.
-
-        Processes each (batch, head) slice as a flat f32 buffer of (seq * hd,).
-        """
-        # MLX -> numpy (this triggers mx.eval if lazy)
-        data_np = np.array(data.astype(mx.float32))  # (B, n_kv, seq, hd)
-        out_np = np.empty_like(data_np)
-
-        for b in range(B):
-            for h in range(n_kv):
-                flat = np.ascontiguousarray(data_np[b, h].reshape(-1))  # (seq * hd,)
-                packed, norms = engine.compress(flat, seq)
-                recon = engine.decompress(packed, norms, seq)
-                out_np[b, h] = recon.reshape(seq, hd)
-
-        return mx.array(out_np).astype(self._input_dtype)
 
     # ---- mlx-lm interface ----
 
@@ -156,9 +185,7 @@ class TurboQuantKVCache:
         from mlx_lm.models.cache import create_attention_mask
 
         if args:
-            N = args[0]
-            rest = args[1:]
-            return create_attention_mask(N, self.offset, *rest, **kwargs)
+            return create_attention_mask(args[0], self.offset, *args[1:], **kwargs)
         return create_attention_mask(offset=self.offset, **kwargs)
 
     def memory_report(self) -> dict:
